@@ -26,7 +26,7 @@ class HyperactiveResource < ActiveResource::Base
   end 
   
   def to_xml(options = {})
-    #RAILS_DEFAULT_LOGGER.debug("** Begin Dumping XML for #{self.class.name}:#{self.id}")    
+    RAILS_DEFAULT_LOGGER.debug("** Begin Dumping XML for #{self.class.name}:#{self.id}")    
     massaged_attributes = attributes.dup
     
     #Massage patient.id into patient_id (for every belongs_to) and    
@@ -34,7 +34,11 @@ class HyperactiveResource < ActiveResource::Base
       if self.belong_tos.include? key.to_sym
         #RAILS_DEFAULT_LOGGER.debug("**** Moving #{key}.id into #{key}_id")        
         massaged_attributes["#{key}_id"] = value.id #TODO Should check respond_to and so on
-        massaged_attributes.delete(key)       
+        massaged_attributes.delete(key)
+      elsif (self.has_ones + self.has_manys).include? key.to_sym
+        # massaged_attributes = {:vendor => {..., ... :address => {....}, :phon } }
+        RAILS_DEFAULT_LOGGER.debug("**** Removing #{key}")        
+        massaged_attributes.delete(key)
       elsif key.to_s =~ /^.*_ids$/
         #RAILS_DEFAULT_LOGGER.warn("**** Deleting #{key}.id because we are using the non ids version")
         massaged_attributes.delete(key)        
@@ -73,14 +77,23 @@ class HyperactiveResource < ActiveResource::Base
   def save_nested
     @saved_nested_resources = {}
     nested_resources.each do |nested_resource_name|
-      resources = attributes[nested_resource_name.to_s.pluralize] 
-      resources ||= send(nested_resource_name.to_s.pluralize)
+      RAILS_DEFAULT_LOGGER.debug("******** Saving nested resource: #{nested_resource_name}. Self: #{self}")
+      association_name = self.class.has_ones.include?(nested_resource_name) ? nested_resource_name : nested_resource_name.to_s.pluralize
+      resources = attributes[association_name]
+      # resources = attributes[nested_resource_name.to_s.pluralize]
+      RAILS_DEFAULT_LOGGER.debug("\tresources (aka 'attributes'): #{resources.inspect}")
+      # resources ||= send(nested_resource_name.to_s.pluralize)
+      resources ||= send(association_name)
+      resources = [*resources] # Force an Array
+      RAILS_DEFAULT_LOGGER.debug("\tresources (aka 'attributes') after send: #{resources.inspect}")
       unless resources.nil?
         resources.each do |resource|
           @saved_nested_resources[nested_resource_name] = []
           #We need to set a reference from this nested resource back to the parent  
 
+          RAILS_DEFAULT_LOGGER.debug "\t Does self respond to #{nested_resource_name}_options? #{self.respond_to?("#{nested_resource_name}_options")}"
           fk = self.respond_to?("#{nested_resource_name}_options") ? self.send("#{nested_resource_name}_options")[:foreign_key]  : "#{self.class.name.underscore}_id"
+          RAILS_DEFAULT_LOGGER.debug("\t foreign_key: #{fk}; self.id: #{self.id}")
           resource.send("#{fk}=", self.id)
           @saved_nested_resources[nested_resource_name] << resource if resource.save
         end
@@ -90,10 +103,12 @@ class HyperactiveResource < ActiveResource::Base
   
   # Update the resource on the remote service.
   def update
-    #RAILS_DEFAULT_LOGGER.debug("******** REST Call to CRMS: Updating #{self.class.name}:#{self.id}")
-    #RAILS_DEFAULT_LOGGER.debug(caller[0..5].join("\n"))                             
+    RAILS_DEFAULT_LOGGER.debug("******** REST Call to CRMS: Updating #{self.class.name}:#{self.id}")
+    # RAILS_DEFAULT_LOGGER.debug(caller[0..5].join("\n"))                             
     response = connection.put(element_path(prefix_options), to_xml, self.class.headers)
+    RAILS_DEFAULT_LOGGER.debug("\t PUT DONE. Saving Nested #{self.class.name}:#{self.id}.")
     save_nested
+    RAILS_DEFAULT_LOGGER.debug("\t Nested #{self.class.name}:#{self.id} saved.")
     load_attributes_from_response(response)
     merge_saved_nested_resources_into_attributes
     response
@@ -101,7 +116,7 @@ class HyperactiveResource < ActiveResource::Base
 
   # Create (i.e., save to the remote service) the new resource.
   def create
-    #RAILS_DEFAULT_LOGGER.debug("******** REST Call to CRMS: Creating #{self.class.name}:#{self.id}")
+    RAILS_DEFAULT_LOGGER.debug("******** REST Call to CRMS: Creating #{self.class.name}:#{self.id}")
     #RAILS_DEFAULT_LOGGER.debug(caller[0..5].join("\n"))
     response = connection.post(collection_path, to_xml, self.class.headers)
     self.id = id_from_response(response) 
@@ -198,6 +213,7 @@ class HyperactiveResource < ActiveResource::Base
 #  then when you first call residency_ids it'll pull the residency ids into the residency_ids..
 #  But future changes aren't kept in sync (like ActiveRecord.. mostly)
   def method_missing(name, *args)
+    RAILS_DEFAULT_LOGGER.debug "#{self.class}#method_missing Looking for '#{name}'"
     return super if attributes.keys.include? name.to_s         
     
     case name
@@ -212,7 +228,9 @@ class HyperactiveResource < ActiveResource::Base
     when *self.has_many_ids
       return has_many_ids_getter_method_missing(name)
     when *self.has_ones
-      return has_one_getter_method_missing(name)      
+      RAILS_DEFAULT_LOGGER.debug "#{self.class}#method_missing Looking in 'has_ones' for '#{name}'"
+      
+      return has_one_getter_method_missing(name)    
     end                                     
 
     super
@@ -277,8 +295,11 @@ class HyperactiveResource < ActiveResource::Base
   end
   
   def has_one_getter_method_missing( name )
+    return nil if self.new?
+    fk = self.respond_to?("#{name}_options") ? self.send("#{name}_options")[:foreign_key] : "#{self.class.name.underscore}_id"
+    
     self.new? ? nil : 
-      call_setter( name, name.to_s.camelize.constantize.send("find_by_#{self.class.name.underscore}_id", self.id) )
+      call_setter( name, name.to_s.camelize.constantize.send("find_by_#{fk}", self.id) )
   end
   
   #Convenience method used by the method_missing methods
@@ -358,7 +379,9 @@ class HyperactiveResource < ActiveResource::Base
   end    
   
   def self.find_by( all, field, *args )
-    find( all.nil? ? :first : :all, :params => { field => args[0] } )      
+    RAILS_DEFAULT_LOGGER.debug "#{self}#find_by Looking up \"#{all}\" over the wire using field: \"#{field}\" and params \"#{args[0]}\""
+    # find( all.nil? ? :first : :all, :params => { field => args[0] } )
+    find( all.nil? ? :first : :all, :params => {self.to_s.downcase =>{ field => args[0] } } )
   end
     
   FINDER_REGEXP = /^find_(?:(all)_?)?by_([a-zA-Z0-9_]+)$/ 
